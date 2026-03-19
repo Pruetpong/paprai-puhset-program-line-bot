@@ -1,30 +1,42 @@
-// Code.gs - Main Webhook Handler & RAG Engine for PAPRAI PU-HSET
-// โค้ดหลักสำหรับจัดการ Webhook และระบบดึงข้อมูลความรู้ (Knowledge Retrieval)
+// Code.gs - Main Webhook Handler for PAPRAI PU-HSET
+// โค้ดหลักสำหรับจัดการ Webhook และ Pipeline การตอบคำถาม
+// เวอร์ชัน: 2.1 (Gap 1–4, 6, 8 + แยก Spreadsheet 2 ไฟล์ + LLM Provider ใน PropertiesService)
 
 /**
  * ====================================
  * WEBHOOK HANDLER
+ * จุดรับข้อมูลจาก LINE Platform
  * ====================================
  */
 
 function doPost(e) {
   const startTime = new Date();
   console.log(`🌐 Webhook received at ${startTime.toISOString()}`);
-  
+
   try {
+    // ตรวจสอบ Request พื้นฐาน
     if (!e.postData || !e.postData.contents) {
+      console.error('❌ Invalid request: no postData');
       return createResponse('Invalid request', 400);
     }
 
     const contents = JSON.parse(e.postData.contents);
     if (!contents.events || !Array.isArray(contents.events)) {
+      console.error('❌ Invalid events format');
       return createResponse('Invalid events', 400);
     }
-    
+
+    console.log(`📨 Processing ${contents.events.length} event(s)`);
+
+    // ดึง Credentials ครั้งเดียว แล้วส่งต่อให้ทุก event
     const credentials = getCredentials();
+
     for (const event of contents.events) {
       processEvent(event, credentials);
     }
+
+    const processingTime = new Date() - startTime;
+    console.log(`✅ Webhook completed in ${processingTime}ms`);
 
     return createResponse({ status: 'success', processed: contents.events.length }, 200);
 
@@ -45,30 +57,45 @@ function processEvent(event, credentials) {
     const { type, replyToken, source } = event;
     const userId = source?.userId;
 
-    // สร้าง Profile ผู้ใช้ทั่วไป (Guest) ทันทีที่ทักมา
+    // สร้าง Guest Profile สำหรับผู้ใช้ทุกคน
     const userProfile = getUserProfile(userId);
-    if (!userProfile) return;
+    if (!userProfile) {
+      console.warn('⚠️ No userId found in event source — skipping');
+      return;
+    }
 
-    // เริ่มแสดง Loading Animation ในห้องแชท
+    // เริ่มแสดง Loading Animation ให้ผู้ใช้เห็นทันทีที่รับข้อความ
     if (userId && ['message', 'follow'].includes(type)) {
-      startLoading(userId);
+      startLoading(userId, credentials);
     }
 
     switch (type) {
       case 'message':
-        handleMessage(event, userProfile);
+        handleMessage(event, userProfile, credentials);
         break;
       case 'follow':
-        handleFollow(replyToken, userProfile);
+        handleFollow(replyToken, credentials);
+        break;
+      case 'unfollow':
+        console.log(`👋 User unfollowed: ${userId}`);
         break;
       default:
         console.log(`⚠️ Unhandled event type: ${type}`);
     }
-    
+
   } catch (error) {
-    console.error(`❌ Error processing event:`, error);
+    console.error('❌ Error processing event:', error);
+    // พยายามส่งข้อความ error กลับหากมี replyToken
     if (event.replyToken) {
-      sendTextMessage(event.replyToken, "ป้าไพรขออภัยค่ะ เกิดข้อผิดพลาดในระบบประมวลผล กรุณาลองใหม่อีกครั้งนะคะ 🙏");
+      try {
+        sendTextMessage(
+          event.replyToken,
+          'ป้าไพรขออภัยค่ะ เกิดข้อผิดพลาดในระบบประมวลผล กรุณาลองใหม่อีกครั้งนะคะ 🙏',
+          getCredentials()
+        );
+      } catch (replyError) {
+        console.error('❌ Failed to send error reply:', replyError);
+      }
     }
   }
 }
@@ -79,204 +106,172 @@ function processEvent(event, credentials) {
  * ====================================
  */
 
-function handleMessage(event, userProfile) {
+function handleMessage(event, userProfile, credentials) {
   const { message, replyToken } = event;
-  
-  if (message.type === 'text') {
-    const User_Message = message.text.trim();
-    
-    // 1. ตรวจสอบคำสั่งพิเศษ (Special Commands)
-    if (handleSpecialCommands(User_Message, replyToken, userProfile)) return;
 
-    // 2. ส่งประมวลผลด้วย AI
-    processAIMessage(User_Message, replyToken, userProfile);
-    
+  if (message.type === 'text') {
+    const userMessage = message.text.trim();
+    console.log(`💬 Text received from ${userProfile.userId}: "${userMessage.substring(0, 50)}..."`);
+
+    // 1. ตรวจสอบคำสั่งพิเศษก่อน
+    if (handleSpecialCommands(userMessage, replyToken, userProfile, credentials)) return;
+
+    // 2. Gap 1: ตรวจสอบ Rate Limit
+    if (!checkRateLimit(userProfile.userId)) {
+      sendTextMessage(
+        replyToken,
+        `ป้าไพรขออภัยด้วยนะคะ วันนี้คุณพ่อคุณแม่หรือน้องๆ ส่งข้อความมาครบ ${APP_CONFIG.RATE_LIMIT_PER_DAY} ข้อความแล้วค่ะ\n\nหากมีคำถามเพิ่มเติม รบกวนติดต่อฝ่ายแนะแนวของโรงเรียนโดยตรงนะคะ 🙏\nหรือลองถามใหม่ได้พรุ่งนี้ค่ะ ✨`,
+        credentials
+      );
+      return;
+    }
+
+    // 3. ประมวลผลด้วย AI
+    processAIMessage(userMessage, replyToken, userProfile, credentials);
+
   } else {
-    // กรณีส่งสติ๊กเกอร์ รูปภาพ หรืออื่นๆ
-    sendTextMessage(replyToken, "ป้าไพรขออภัยค่ะ ตอนนี้ป้าไพรรองรับเฉพาะการตอบคำถามด้วย 'ข้อความ' เท่านั้นนะคะ พิมพ์คำถามทิ้งไว้ได้เลยค่ะ 📝");
+    // รองรับเฉพาะ text เท่านั้น
+    sendTextMessage(
+      replyToken,
+      'ป้าไพรขออภัยค่ะ ตอนนี้ป้าไพรรองรับเฉพาะการตอบคำถามด้วย "ข้อความ" เท่านั้นนะคะ\nพิมพ์คำถามทิ้งไว้ได้เลยค่ะ 📝',
+      credentials
+    );
   }
 }
 
-function handleSpecialCommands(User_Message, replyToken, userProfile) {
-  const command = User_Message.toLowerCase();
-  
+/**
+ * ====================================
+ * SPECIAL COMMANDS
+ * คำสั่งพิเศษที่ตรวจก่อน AI pipeline เสมอ
+ * ====================================
+ */
+
+function handleSpecialCommands(userMessage, replyToken, userProfile, credentials) {
+  const command = userMessage.toLowerCase().trim();
+
   switch (command) {
+
     case '/clear':
     case 'clear':
+      // Gap 8: ใช้ batch delete แทนการลบทีละแถว (อยู่ใน Config.gs)
       clearChatHistory(userProfile.userId);
-      sendTextMessage(replyToken, "✅ ป้าไพรล้างความจำประวัติการสนทนาให้เรียบร้อยแล้วค่ะ เริ่มคุยเรื่องใหม่ได้เลยนะคะ");
+      sendTextMessage(
+        replyToken,
+        '✅ ป้าไพรล้างความจำประวัติการสนทนาให้เรียบร้อยแล้วค่ะ\nเริ่มคุยเรื่องใหม่ได้เลยนะคะ 😊',
+        credentials
+      );
       return true;
-      
+
     case '/help':
     case 'help':
-      const helpText = `🤖 คู่มือการใช้งาน PAPRAI PU-HSET\n\nสวัสดีค่ะ ป้าไพรยินดีให้คำปรึกษาเกี่ยวกับหลักสูตรห้องเรียนพิเศษ (PU-HSET) ค่ะ 😊\n\n📌 คำสั่งพื้นฐาน:\n• พิมพ์คำถามที่สงสัยได้เลย เช่น "ค่าเทอมเท่าไหร่", "สายวิทย์เรียนอะไรบ้าง"\n• พิมพ์ /clear เพื่อลบประวัติการคุย\n• พิมพ์ /help เพื่ออ่านคู่มือนี้\n\nมีอะไรให้ป้าไพรช่วยอธิบายไหมคะ?`;
-      sendTextMessage(replyToken, helpText);
+      sendTextMessage(replyToken, buildHelpMessage(), credentials);
       return true;
-      
+
+    case '/refresh':
+      // Admin command: ล้าง Knowledge Cache เพื่อดึงข้อมูล FAQ ใหม่ทันที
+      // ใช้เมื่อ Staff อัปเดต FAQ_Data แล้วต้องการให้มีผลทันที
+      forceRefreshKnowledgeCache();
+      sendTextMessage(
+        replyToken,
+        '🔄 ป้าไพรล้าง Cache ข้อมูลหลักสูตรเรียบร้อยแล้วค่ะ\nข้อมูลชุดใหม่จะถูกโหลดในการตอบคำถามครั้งถัดไปนะคะ ✅',
+        credentials
+      );
+      return true;
+
     default:
       return false;
   }
 }
 
 /**
- * ====================================
- * AI & KNOWLEDGE RETRIEVAL (RAG)
- * ====================================
+ * สร้างข้อความ Help
  */
+function buildHelpMessage() {
+  return `🤖 คู่มือการใช้งาน PAPRAI PU-HSET
 
-function processAIMessage(User_Message, replyToken, userProfile) {
-  try {
-    console.log(`🤖 Processing AI request...`);
-    
-    // 1. ดึงข้อมูลจากฐานข้อมูล Google Sheets (Knowledge Base)
-    const retrievedContext = retrieveKnowledge();
-    
-    // 2. ดึงประวัติการสนทนาก่อนหน้า
-    const chatHistory = getChatHistory(userProfile.userId);
-    
-    // 3. สร้าง Prompt
-    const systemPrompt = getSystemPrompt();
-    const userPrompt = constructUserPrompt(chatHistory, retrievedContext, User_Message);
-    
-    // 4. เรียก OpenAI API
-    const AI_Response = generateAIResponse(systemPrompt, userPrompt);
-    
-    // 5. วิเคราะห์หมวดหมู่ และประเมิน Tokens ที่ใช้
-    const category = autoTagMessage(User_Message);
-    const Tokens_Used = estimateTokens(User_Message + AI_Response);
-    
-    // 6. บันทึกข้อมูลลง Sheets
-    saveChatHistory(userProfile, User_Message, AI_Response, category, Tokens_Used);
-    
-    // 7. ส่งคำตอบกลับไปที่ LINE
-    sendTextMessage(replyToken, AI_Response);
-    
-  } catch (error) {
-    console.error('❌ AI processing error:', error);
-    sendTextMessage(replyToken, "ป้าไพรขออภัยค่ะ ขณะนี้มีผู้สอบถามเข้ามาเป็นจำนวนมาก หรือระบบกำลังขัดข้อง รบกวนคุณพ่อคุณแม่ลองพิมพ์ถามใหม่อีกครั้งในสักครู่นะคะ ⏳🙏");
-  }
-}
+สวัสดีค่ะ ป้าไพรยินดีให้คำปรึกษาเกี่ยวกับ
+หลักสูตรห้องเรียนพิเศษ PU-HSET ค่ะ 😊
 
-// ฟังก์ชันดึงความรู้ทั้งหมดจากแผ่นงาน FAQ_Data และ Curriculum_Info
-function retrieveKnowledge() {
-  try {
-    const credentials = getCredentials();
-    if (!credentials.SPREADSHEET_ID) return '';
-    
-    const ss = SpreadsheetApp.openById(credentials.SPREADSHEET_ID);
-    let context = '';
+📌 วิธีใช้งาน
+━━━━━━━━━━━━━━━━━━━━━━
 
-    // ดึงข้อมูล FAQ
-    const faqSheet = ss.getSheetByName('FAQ_Data');
-    if (faqSheet) {
-      const data = faqSheet.getDataRange().getDisplayValues();
-      if (data.length > 1) {
-        context += '📌 [คำถามที่พบบ่อย (FAQ)]:\n';
-        for (let i = 1; i < data.length; i++) {
-          if (data[i][1] && data[i][2]) {
-            context += `คำถาม: ${data[i][1]}\nคำตอบ: ${data[i][2]}\n\n`;
-          }
-        }
-      }
-    }
+💬 พิมพ์คำถามได้เลยค่ะ เช่น
+   • "ค่าเทอมเท่าไหร่"
+   • "สายวิทย์สุขภาพเรียนอะไรบ้าง"
+   • "รับนักเรียนกี่คน"
+   • "แตกต่างจากห้องวิทย์ทั่วไปยังไง"
 
-    // ดึงข้อมูลโครงสร้างหลักสูตร
-    const curSheet = ss.getSheetByName('Curriculum_Info');
-    if (curSheet) {
-      const data = curSheet.getDataRange().getDisplayValues();
-      if (data.length > 1) {
-        context += '📚 [ข้อมูลเชิงลึกและโครงสร้างหลักสูตร]:\n';
-        for (let i = 1; i < data.length; i++) {
-          if (data[i][0] && data[i][1]) {
-            context += `หัวข้อ: ${data[i][0]}\nรายละเอียด: ${data[i][1]}\n\n`;
-          }
-        }
-      }
-    }
-    
-    return context;
-  } catch (error) {
-    console.error('❌ Error retrieving knowledge:', error);
-    return '';
-  }
+🔧 คำสั่งพิเศษ
+━━━━━━━━━━━━━━━━━━━━━━
+
+• /clear — ล้างประวัติการสนทนา
+• /help  — แสดงคู่มือนี้
+
+⚠️ หมายเหตุ
+━━━━━━━━━━━━━━━━━━━━━━
+
+ป้าไพรตอบได้สูงสุด ${APP_CONFIG.RATE_LIMIT_PER_DAY} คำถามต่อวันค่ะ
+
+มีอะไรให้ป้าไพรช่วยอธิบายไหมคะ? 🎓`;
 }
 
 /**
  * ====================================
- * DATA LOGGING & HISTORY
+ * AI PROCESSING PIPELINE (RAG)
+ * ขั้นตอน: Knowledge → History → Prompt → AI → Log → Reply
  * ====================================
  */
 
-function getChatHistory(User_ID) {
+function processAIMessage(userMessage, replyToken, userProfile, credentials) {
   try {
-    const ss = SpreadsheetApp.openById(getCredentials().SPREADSHEET_ID);
-    const sheet = ss.getSheetByName('Chat_History');
-    if (!sheet) return [];
-    
-    const data = sheet.getDataRange().getValues();
-    
-    // ดึงเฉพาะประวัติของผู้ใช้คนนี้ และจำกัดจำนวนตาม MAX_HISTORY
-    const userHistory = data
-      .filter(row => row[1] === User_ID) // Column B = User_ID
-      .slice(-APP_CONFIG.MAX_HISTORY)
-      .map(row => ({
-        userMessage: row[2], // Column C = User_Message
-        aiResponse: row[3]   // Column D = AI_Response
-      }));
-      
-    return userHistory;
-  } catch (error) {
-    console.error('❌ Error getting history:', error);
-    return [];
-  }
-}
+    console.log(`🤖 Starting AI pipeline for user: ${userProfile.userId}`);
 
-function saveChatHistory(userProfile, User_Message, AI_Response, category, Tokens_Used) {
-  try {
-    const ss = SpreadsheetApp.openById(getCredentials().SPREADSHEET_ID);
-    const sheet = ss.getSheetByName('Chat_History');
-    if (!sheet) return;
-    
-    const timestamp = new Date();
-    
-    // ลำดับ Column: Timestamp, User_ID, User_Message, AI_Response, Category, Tokens_Used
-    sheet.appendRow([
-      timestamp, 
-      userProfile.userId, 
-      User_Message, 
-      AI_Response, 
-      category, 
-      Tokens_Used
-    ]);
-    
-    // อัปเดตสถิติรายวัน (อ้างอิงฟังก์ชันใน Config.gs)
-    if (typeof updateAnalytics === 'function') {
-      updateAnalytics(userProfile, category, Tokens_Used);
-    }
-    
-  } catch (error) {
-    console.error('❌ Error saving history:', error);
-  }
-}
+    // ขั้นที่ 1: Gap 4 — ดึง Knowledge Base ผ่าน Cache
+    // (ดึงจาก Sheets เฉพาะเมื่อ Cache หมดอายุ ลด Sheets API calls)
+    const retrievedContext = getKnowledgeWithCache();
 
-function clearChatHistory(User_ID) {
-  try {
-    const ss = SpreadsheetApp.openById(getCredentials().SPREADSHEET_ID);
-    const sheet = ss.getSheetByName('Chat_History');
-    if (!sheet) return;
-    
-    const data = sheet.getDataRange().getValues();
-    const rowsToDelete = [];
-    
-    for (let i = data.length - 1; i >= 1; i--) {
-      if (data[i][1] === User_ID) {
-        rowsToDelete.push(i + 1);
-      }
-    }
-    
-    rowsToDelete.forEach(rowNum => sheet.deleteRow(rowNum));
+    // ขั้นที่ 2: Gap 6 — ดึงประวัติการสนทนา (มี null guard แล้ว)
+    const chatHistory = getChatHistory(userProfile.userId);
+
+    // ขั้นที่ 3: สร้าง Prompt
+    // Gap 3 — Fallback instruction ถูกต้อง (ห้ามใช้ความรู้ทั่วไป)
+    const systemPrompt = getSystemPrompt();
+    const userPrompt   = constructUserPrompt(chatHistory, retrievedContext, userMessage);
+
+    // ขั้นที่ 4: เรียก LLM API
+    // (ใช้ credentials.LLM_MODEL และ credentials.LLM_ENDPOINT จาก PropertiesService)
+    const startAI   = new Date();
+    const aiResponse = generateAIResponse(systemPrompt, userPrompt);
+    const aiTime    = new Date() - startAI;
+    console.log(`⏱️ LLM responded in ${aiTime}ms`);
+
+    // ขั้นที่ 5: วิเคราะห์หมวดหมู่และประเมิน Tokens
+    const category   = autoTagMessage(userMessage);
+    const tokensUsed = estimateTokens(userMessage + aiResponse);
+
+    // ขั้นที่ 6: Gap 2 — บันทึก Log (มี LockService แล้ว)
+    saveChatHistory(userProfile, userMessage, aiResponse, category, tokensUsed);
+    updateAnalytics(userProfile, category, tokensUsed);
+
+    // ขั้นที่ 7: ส่งคำตอบกลับไปที่ LINE
+    sendTextMessage(replyToken, aiResponse, credentials);
+    console.log(`✅ AI pipeline complete (${aiTime}ms)`);
+
   } catch (error) {
-    console.error('❌ Error clearing history:', error);
+    console.error('❌ AI pipeline error:', error);
+
+    // สร้างข้อความ error ที่เหมาะสมตามประเภทของ error
+    let errorMessage = 'ป้าไพรขออภัยค่ะ ขณะนี้ระบบกำลังขัดข้อง รบกวนลองพิมพ์ถามใหม่อีกครั้งในสักครู่นะคะ ⏳🙏';
+
+    if (error.message.includes('API key invalid')) {
+      errorMessage = 'ป้าไพรขออภัยค่ะ มีปัญหาในการเชื่อมต่อระบบ AI กรุณาติดต่อผู้ดูแลระบบนะคะ 🔧';
+    } else if (error.message.includes('rate limit')) {
+      errorMessage = 'ป้าไพรขออภัยค่ะ ระบบ AI มีผู้ใช้งานหนักมากในขณะนี้ รบกวนรอสักครู่แล้วลองใหม่อีกครั้งนะคะ ⏳';
+    } else if (error.message.includes('LLM_MODEL') || error.message.includes('LLM_ENDPOINT')) {
+      errorMessage = 'ป้าไพรขออภัยค่ะ ระบบยังตั้งค่าไม่สมบูรณ์ กรุณาติดต่อผู้ดูแลระบบนะคะ 🔧';
+    }
+
+    sendTextMessage(replyToken, errorMessage, credentials);
   }
 }
 
@@ -286,47 +281,98 @@ function clearChatHistory(User_ID) {
  * ====================================
  */
 
-function sendTextMessage(replyToken, text) {
-  const credentials = getCredentials();
-  const url = 'https://api.line.me/v2/bot/message/reply';
-  const options = {
-    headers: {
-      'Content-Type': 'application/json; charset=UTF-8',
-      'Authorization': `Bearer ${credentials.LINE_CHANNEL_ACCESS_TOKEN}`,
-    },
-    method: 'post',
-    payload: JSON.stringify({
-      replyToken: replyToken,
-      messages: [{ type: 'text', text: text }]
-    }),
-    muteHttpExceptions: true
-  };
-
-  UrlFetchApp.fetch(url, options);
-}
-
-function handleFollow(replyToken, userProfile) {
-  const welcomeText = `สวัสดีค่ะ ยินดีต้อนรับเข้าสู่บริการถาม-ตอบ หลักสูตรห้องเรียนพิเศษ เตรียมอุดมวิทยาศาสตร์สุขภาพ และวิศวกรรมเทคโนโลยี (PU-HSET) โรงเรียนสาธิต มหาวิทยาลัยศิลปากร (มัธยมศึกษา) 🎓✨\n\nฉันคือ "ป้าไพร" AI ผู้ช่วยแนะแนวประจำหลักสูตรนี้ค่ะ คุณพ่อคุณแม่หรือนักเรียนสามารถพิมพ์คำถามที่สงสัยเกี่ยวกับหลักสูตร การเรียนการสอน หรือค่าเทอม ทิ้งไว้ได้เลยนะคะ ป้าไพรพร้อมให้ข้อมูลค่ะ 😊`;
-  sendTextMessage(replyToken, welcomeText);
-}
-
-function startLoading(userId) {
+/**
+ * ส่งข้อความ Text กลับไปที่ LINE
+ * @param {string} replyToken - Token สำหรับ Reply
+ * @param {string} text       - ข้อความที่จะส่ง
+ * @param {object} credentials - Credentials object จาก getCredentials()
+ */
+function sendTextMessage(replyToken, text, credentials) {
   try {
-    const credentials = getCredentials();
+    const url = 'https://api.line.me/v2/bot/message/reply';
+    const options = {
+      method:  'post',
+      headers: {
+        'Content-Type':  'application/json; charset=UTF-8',
+        'Authorization': `Bearer ${credentials.LINE_CHANNEL_ACCESS_TOKEN}`
+      },
+      payload: JSON.stringify({
+        replyToken: replyToken,
+        messages:   [{ type: 'text', text: text }]
+      }),
+      muteHttpExceptions: true
+    };
+
+    const response     = UrlFetchApp.fetch(url, options);
+    const responseCode = response.getResponseCode();
+
+    if (responseCode !== 200) {
+      console.error(`LINE Reply API Error (${responseCode}):`, response.getContentText());
+    }
+
+  } catch (error) {
+    console.error('❌ Error sending text message:', error);
+    throw error;
+  }
+}
+
+/**
+ * แสดง Loading Animation ในหน้าแชท
+ * ให้ผู้ใช้รู้ว่าระบบกำลังประมวลผลอยู่
+ */
+function startLoading(userId, credentials) {
+  try {
     const url = 'https://api.line.me/v2/bot/chat/loading/start';
     const options = {
+      method:  'post',
       headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${credentials.LINE_CHANNEL_ACCESS_TOKEN}`,
+        'Content-Type':  'application/json',
+        'Authorization': `Bearer ${credentials.LINE_CHANNEL_ACCESS_TOKEN}`
       },
-      method: 'post',
-      payload: JSON.stringify({ chatId: userId }),
+      payload:            JSON.stringify({ chatId: userId }),
       muteHttpExceptions: true
     };
     UrlFetchApp.fetch(url, options);
+    console.log('⏳ Loading indicator started');
   } catch (error) {
+    // Loading indicator ไม่ใช่ฟังก์ชันหลัก ไม่ต้อง throw
     console.error('⚠️ Failed to start loading indicator:', error);
   }
+}
+
+/**
+ * ====================================
+ * EVENT HANDLERS
+ * ====================================
+ */
+
+/**
+ * ส่งข้อความต้อนรับเมื่อผู้ใช้ Add เพื่อนครั้งแรก
+ */
+function handleFollow(replyToken, credentials) {
+  console.log('👋 New follower');
+  const welcomeText = `สวัสดีค่ะ ยินดีต้อนรับเข้าสู่บริการถาม-ตอบ 🎓✨
+
+หลักสูตรห้องเรียนพิเศษ
+เตรียมอุดมวิทยาศาสตร์สุขภาพ และวิศวกรรมเทคโนโลยี
+(PU-HSET)
+
+โรงเรียนสาธิต มหาวิทยาลัยศิลปากร (มัธยมศึกษา)
+
+━━━━━━━━━━━━━━━━━━━━━━
+
+ฉันคือ "ป้าไพร" AI ผู้ช่วยแนะแนวประจำหลักสูตรค่ะ 😊
+
+คุณพ่อคุณแม่หรือนักเรียนสามารถพิมพ์คำถาม
+ที่สงสัยได้เลยนะคะ เช่น
+
+📌 "ค่าเทอมเท่าไหร่"
+📌 "สายวิทย์สุขภาพกับวิศวะต่างกันยังไง"
+📌 "จบแล้วเรียนต่อสาขาไหนได้บ้าง"
+
+ป้าไพรพร้อมให้ข้อมูลค่ะ 🙏`;
+
+  sendTextMessage(replyToken, welcomeText, credentials);
 }
 
 /**
@@ -335,14 +381,22 @@ function startLoading(userId) {
  * ====================================
  */
 
-function createResponse(data, statusCode = 200) {
+/**
+ * สร้าง HTTP Response สำหรับ doPost
+ * หมายเหตุ: ContentService ใน GAS ไม่รองรับ setStatusCode()
+ * จึง return status 200 เสมอ (LINE Platform ไม่ได้อ่าน status code จาก webhook response)
+ */
+function createResponse(data) {
   const output = typeof data === 'string' ? { message: data } : data;
-  return ContentService.createTextOutput(JSON.stringify(output))
-    .setMimeType(ContentService.MimeType.JSON)
-    .setStatusCode(statusCode);
+  return ContentService
+    .createTextOutput(JSON.stringify(output))
+    .setMimeType(ContentService.MimeType.JSON);
 }
 
+/**
+ * ประมาณการ Tokens ที่ใช้ (สำหรับบันทึกสถิติ)
+ * ภาษาไทย: ~1 คำ ≈ 2-3 tokens / ใช้ 2.5 เป็นค่ากลาง
+ */
 function estimateTokens(text) {
-  // ประมาณการ Tokens คร่าวๆ (สำหรับภาษาไทยมักใช้ 1 คำ ~ 2-3 tokens)
   return Math.ceil(text.length / 2.5);
 }
